@@ -1,0 +1,100 @@
+#!/bin/bash
+# t2-suspend-diag - diagnostics for t2-suspend-fix
+# https://github.com/cairolidavide/t2-suspend-fix
+#
+#   t2-suspend-diag           system report + last suspend cycle
+#   t2-suspend-diag --trace   time every device during the next suspend cycle
+#   t2-suspend-diag --slowest after a traced cycle: the slowest devices
+#
+# Run with sudo for the kernel log (dmesg).
+
+set -u
+export LC_ALL=C
+HOOK=/usr/lib/systemd/system-sleep/t2-suspend-fix
+
+section() { printf '\n== %s\n' "$*"; }
+need_root() {
+  [ "$(id -u)" -eq 0 ] && return 0
+  echo "This option needs root: sudo $0 $*" >&2
+  exit 1
+}
+
+case "${1:-}" in
+  --trace)
+    need_root "$@"
+    echo 1 > /sys/power/pm_print_times
+    echo "Device timing enabled until reboot. Suspend and wake the Mac, then run:"
+    echo "  sudo $0 --slowest"
+    exit 0
+    ;;
+  --slowest)
+    need_root "$@"
+    if [ "$(cat /sys/power/pm_print_times)" != 1 ]; then
+      echo "Timing is not enabled: run 'sudo $0 --trace' and suspend first." >&2
+      exit 1
+    fi
+    # Last cycle only; the kernel log may have dropped older lines
+    dmesg | awk '/PM: suspend entry/{buf=""} {buf=buf"\n"$0} END{print buf}' \
+      | grep -E 'complete after|returned [-0-9]+ after' \
+      | sed -E 's/^\[[ 0-9.]+\] //' \
+      | awk '{for(i=1;i<NF;i++) if($i=="after"){v=$(i+1); if($(i+2)=="msecs") v*=1000; print v"\t"$0}}' \
+      | sort -rn | head -15 | cut -f2-
+    exit 0
+    ;;
+  ""|--report) ;;
+  *)
+    sed -n '4,9p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+    ;;
+esac
+
+section "System"
+echo "Model:          $(cat /sys/class/dmi/id/product_name 2>/dev/null)"
+echo "Firmware:       $(cat /sys/class/dmi/id/bios_version 2>/dev/null)"
+echo "Distribution:   $(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown}")"
+echo "Kernel:         $(uname -r)"
+echo "systemd:        $(systemctl --version | awk 'NR==1{print $2}')"
+echo "T2 driver:      $(lsmod | awk '$1 ~ /^(t2bce_core|apple_bce)$/ {print $1}' | tr '\n' ' ')"
+echo "mem_sleep:      $(cat /sys/power/mem_sleep)"
+echo "Sleep targets:  $(for t in sleep suspend; do printf '%s=%s ' $t "$(systemctl is-enabled $t.target 2>/dev/null)"; done)"
+
+section "t2-suspend-fix"
+if [ -x "$HOOK" ]; then
+  out=$("$HOOK" detect)
+  echo "${out:-Installed hook does not support 'detect': reinstall the latest version}"
+else
+  echo "Hook not installed ($HOOK missing)"
+fi
+
+section "Other sleep hooks (may conflict)"
+others=$(grep -lE 'apple.bce|t2bce|brcmfmac|hci_bcm|thunderbolt|tiny-dfr' \
+  /usr/lib/systemd/system-sleep/* 2>/dev/null | grep -v "/t2-suspend-fix$")
+echo "${others:-none}"
+
+section "Last suspend cycle (hook log, this boot)"
+journalctl -b -t t2-suspend-fix -o short-iso-precise --no-pager -q 2>/dev/null \
+  | awk '/: pre /{if(!inpre) buf=""; inpre=1} !/: pre /{inpre=0} {buf=buf $0 "\n"} END{printf "%s", buf}' \
+  | sed -E 's/^[0-9-]+T([0-9:]{8}\.[0-9]{3})[^ ]* [^ ]* [^ ]*: /\1  /' || true
+[ -n "$(journalctl -b -t t2-suspend-fix -q --no-pager 2>/dev/null)" ] || echo "no suspend since boot"
+
+section "Last resume timing (kernel)"
+if [ "$(id -u)" -ne 0 ]; then
+  echo "run with sudo to read the kernel log"
+else
+  dmesg | awk '
+    /ACPI: PM: Waking up from system sleep state/ {w=substr($0,2,index($0,"]")-2)+0}
+    /PM: suspend exit/ && w {e=substr($0,2,index($0,"]")-2)+0; last=sprintf("%.2f s from firmware wake-up to end of resume", e-w); w=0}
+    END {print (last ? last : "no resume found in the kernel log")}'
+  echo "For per-device timing: sudo $0 --trace, suspend, then sudo $0 --slowest"
+fi
+
+section "Errors since last resume"
+since=$(journalctl -b -t t2-suspend-fix -o short-iso --no-pager -q 2>/dev/null | grep ' post ' | tail -1 | cut -d' ' -f1)
+if [ -n "$since" ]; then
+  journalctl -b -k -p err --since "$since" --no-pager -q 2>/dev/null \
+    | grep -vE 'brcmf_(p2p|cfg80211_add_iface|fw_alloc_request|c_process_txcap_blob|c_preinit_dcmds)|Bad flag given|command 0xfd98 tx timeout|kbd_backlight|Unexpected transfer queue event' \
+    | tail -15
+  echo "(known harmless messages filtered out)"
+else
+  echo "no resume since boot"
+fi

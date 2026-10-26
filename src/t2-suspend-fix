@@ -1,0 +1,249 @@
+#!/bin/bash
+# t2-suspend-fix - systemd-sleep hook for Apple T2 Macs running Linux
+# https://github.com/cairolidavide/t2-suspend-fix
+#
+# Installed in /usr/lib/systemd/system-sleep/ and run by systemd-sleep with:
+#   pre  <suspend|hibernate|hybrid-sleep|suspend-then-hibernate>
+#   post <suspend|hibernate|hybrid-sleep|suspend-then-hibernate>
+# plus an internal "resume" phase started with systemd-run after "post".
+#
+# What it does (each step is auto-detected and can be disabled in
+# /etc/t2-suspend-fix.conf):
+#
+# 1. Wi-Fi / Bluetooth: the Broadcom brcmfmac driver can fail pci_pm_suspend
+#    (-EIO) and abort the suspend. Repeated aborted suspends make the T2 time
+#    out, killing keyboard, trackpad, Touch Bar and audio. Wi-Fi and
+#    Bluetooth are functions of the same chip, so both drivers are unloaded
+#    before sleeping (Bluetooth first) and reloaded afterwards.
+# 2. Thunderbolt: the Intel Thunderbolt 3 bridge can take ~10 s to resume,
+#    delaying the whole wake-up. If nothing is plugged into the USB-C ports,
+#    the Thunderbolt PCI branch is removed before sleeping and rescanned
+#    right after (~50 ms).
+# 3. Touch Bar: on resume the T2 re-enumerates the Touch Bar, so tiny-dfr
+#    (bound to its devices) stops and must be restarted. The backlight driver
+#    is reloaded with brightness=0 so the Touch Bar stays dark until tiny-dfr
+#    is ready, instead of flashing the default layout.
+# 4. Keyboard backlight and user services (e.g. wluma) that hold stale sysfs
+#    handles are restored/restarted.
+#
+# The T2 itself (apple-bce / t2bce drivers) is NOT touched: recent drivers
+# save and restore its state natively.
+
+set -u
+
+NAME=t2-suspend-fix
+CONF=/etc/t2-suspend-fix.conf
+STATE=/run/t2-suspend-fix
+SELF=$(readlink -f "$0")
+
+# Defaults, overridable in $CONF
+RELOAD_WIFI_BT=yes
+FAST_THUNDERBOLT_RESUME=auto
+TOUCHBAR_FIX=auto
+RESTORE_KBD_BACKLIGHT=yes
+RESTART_USER_SERVICES="wluma.service"
+[ -r "$CONF" ] && . "$CONF"
+
+KBD=/sys/class/leds/apple::kbd_backlight
+
+log() { logger -t "$NAME" "$*"; }
+run() { "$@" 2>&1 | logger -t "$NAME"; }
+attr() { cat "$1/$2" 2>/dev/null; }
+
+is_t2() {
+  local d
+  for d in /sys/bus/pci/devices/*; do
+    [ "$(attr "$d" vendor)" = 0x106b ] && [ "$(attr "$d" device)" = 0x1801 ] && return 0
+  done
+  return 1
+}
+
+# --- Wi-Fi / Bluetooth ------------------------------------------------------
+
+# Kernel modules bound to Broadcom PCI functions: Bluetooth first, then Wi-Fi
+broadcom_modules() {
+  local d mod bt="" wifi=""
+  for d in /sys/bus/pci/devices/*; do
+    [ "$(attr "$d" vendor)" = 0x14e4 ] && [ -e "$d/driver/module" ] || continue
+    mod=$(basename "$(readlink -f "$d/driver/module")")
+    case "$mod" in
+      hci_*) bt="$bt $mod" ;;
+      *)     wifi="$wifi $mod" ;;
+    esac
+  done
+  echo $bt $wifi | tr ' ' '\n' | awk 'NF && !seen[$0]++'
+}
+
+# Unload a module after the modules that depend on it (e.g. brcmfmac_wcc)
+unload_tree() {
+  local h
+  for h in /sys/module/"$1"/holders/*; do
+    [ -e "$h" ] && unload_tree "${h##*/}"
+  done
+  [ -e /sys/module/"$1" ] && run modprobe -r "$1"
+}
+
+# --- Thunderbolt ------------------------------------------------------------
+
+# "root_port branch_top" for every Thunderbolt controller (NHI) that sits
+# behind a PCIe bridge, e.g. "0000:00:1c.4 0000:03:00.0". CPU-integrated
+# Thunderbolt (NHI directly on the root bus) is skipped.
+thunderbolt_branches() {
+  local d p parts
+  for d in /sys/bus/pci/devices/*; do
+    [ "$(attr "$d" vendor)" = 0x8086 ] && [ "$(attr "$d" class)" = 0x088000 ] || continue
+    p=$(readlink -f "$d")
+    IFS=/ read -ra parts <<< "${p#/sys/devices/}"
+    # pci0000:00 / root port / branch top / ... / NHI
+    [ "${#parts[@]}" -ge 4 ] || continue
+    case "$(attr "/sys/bus/pci/devices/${parts[2]}" class)" in
+      0x0604*) echo "${parts[1]} ${parts[2]}" ;;
+    esac
+  done | sort -u
+}
+
+# True if nothing is plugged into the USB-C ports behind this root port
+usbc_idle() {
+  local root=$1
+  # USB devices other than the controller's own root hubs (vendor 1d6b)
+  find "$(readlink -f "/sys/bus/pci/devices/$root")" -name idVendor -exec cat {} + 2>/dev/null \
+    | grep -qv '^1d6b$' && return 1
+  # Thunderbolt devices other than the host routers (X-0)
+  ls /sys/bus/thunderbolt/devices/ 2>/dev/null | grep -qE '^[0-9]+-[1-9]' && return 1
+  # External displays (DisplayPort alt mode)
+  grep -qx connected /sys/class/drm/card*-{DP,HDMI-A}-*/status 2>/dev/null && return 1
+  return 0
+}
+
+# --- Touch Bar --------------------------------------------------------------
+
+tinydfr_wait_devices() {
+  local i
+  for i in $(seq 100); do
+    systemctl is-active --quiet dev-tiny_dfr_display.device \
+      dev-tiny_dfr_backlight.device && return 0
+    sleep 0.02
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+
+if ! is_t2; then
+  [ "${1:-}" = detect ] && echo "No Apple T2 (PCI 106b:1801) found: nothing to do."
+  exit 0
+fi
+
+case "${1:-}" in
+  detect)
+    # Read-only: show what the hook would act on
+    echo "Model:                 $(attr /sys/class/dmi/id product_name)"
+    echo "Kernel:                $(uname -r)"
+    echo "Wi-Fi/BT modules:      $(broadcom_modules | tr '\n' ' ')"
+    branches=$(thunderbolt_branches)
+    if [ -n "$branches" ]; then
+      while read -r root branch; do
+        state=idle; usbc_idle "$root" || state="in use"
+        echo "Thunderbolt branch:    $branch (root port $root, USB-C $state)"
+      done <<< "$branches"
+    else
+      echo "Thunderbolt branch:    none behind a PCIe bridge"
+    fi
+    echo "tiny-dfr:              $(systemctl is-active tiny-dfr.service 2>/dev/null)"
+    echo "Touch Bar backlight:   $([ -e /sys/module/hid_appletb_bl ] && echo hid_appletb_bl || echo not loaded)"
+    echo "Keyboard backlight:    $([ -e "$KBD" ] && echo "$KBD" || echo none)"
+    echo "Config:                $([ -r "$CONF" ] && echo "$CONF" || echo "defaults")"
+    echo "  RELOAD_WIFI_BT=$RELOAD_WIFI_BT FAST_THUNDERBOLT_RESUME=$FAST_THUNDERBOLT_RESUME TOUCHBAR_FIX=$TOUCHBAR_FIX"
+    echo "  RESTORE_KBD_BACKLIGHT=$RESTORE_KBD_BACKLIGHT RESTART_USER_SERVICES=\"$RESTART_USER_SERVICES\""
+    ;;
+
+  pre)
+    rm -rf "$STATE"; mkdir -p "$STATE"
+    log "pre $2: $(attr /sys/class/dmi/id product_name), kernel $(uname -r)"
+
+    if systemctl is-active --quiet tiny-dfr.service; then
+      touch "$STATE/tinydfr"
+      if [ "$TOUCHBAR_FIX" != no ] && [ -e /sys/module/hid_appletb_bl ]; then
+        touch "$STATE/touchbar-bl"
+        run modprobe -r hid_appletb_bl
+      fi
+    fi
+
+    if [ "$RESTORE_KBD_BACKLIGHT" = yes ] && [ -e "$KBD/brightness" ]; then
+      cat "$KBD/brightness" > "$STATE/kbd-backlight"
+    fi
+
+    if [ "$RELOAD_WIFI_BT" = yes ]; then
+      broadcom_modules > "$STATE/modules"
+      log "pre $2: unloading $(tr '\n' ' ' < "$STATE/modules")"
+      while read -r m; do unload_tree "$m"; done < "$STATE/modules"
+    fi
+
+    if [ "$FAST_THUNDERBOLT_RESUME" != no ]; then
+      thunderbolt_branches | while read -r root branch; do
+        if usbc_idle "$root"; then
+          log "pre $2: removing Thunderbolt branch $branch (root port $root)"
+          echo "$root $branch" >> "$STATE/thunderbolt"
+          echo 1 > "/sys/bus/pci/devices/$branch/remove"
+        else
+          log "pre $2: USB-C in use behind $root, keeping Thunderbolt (slow resume)"
+        fi
+      done
+    fi
+    ;;
+
+  post)
+    # Synchronous: the USB-C ports must never stay without their bus
+    if [ -s "$STATE/thunderbolt" ]; then
+      while read -r root branch; do
+        [ -e "/sys/bus/pci/devices/$branch" ] && continue
+        echo 1 > "/sys/bus/pci/devices/$root/rescan"
+        log "post $2: Thunderbolt rescan of $root, branch back: $([ -e "/sys/bus/pci/devices/$branch" ] && echo yes || echo NO)"
+      done < "$STATE/thunderbolt"
+    fi
+
+    # tiny-dfr fails immediately if its devices are not active yet in
+    # systemd, so wait for them (tens of ms, 2 s at most) before restarting
+    if [ -e "$STATE/tinydfr" ]; then
+      [ -e "$STATE/touchbar-bl" ] && run modprobe hid_appletb_bl brightness=0
+      tinydfr_wait_devices
+      systemctl restart --no-block tiny-dfr.service
+    fi
+
+    # Everything else runs in the background, outside the hook's cgroup:
+    # the desktop is already awake and should not wait for it
+    log "post $2: scheduling resume tasks"
+    run systemd-run --no-block --unit="$NAME-resume-$$" "$SELF" resume
+    ;;
+
+  resume)
+    udevadm settle --timeout=5
+
+    # Safety net in case the restart in "post" failed
+    if [ -e "$STATE/tinydfr" ] && ! systemctl is-active --quiet tiny-dfr.service; then
+      log "resume: tiny-dfr not running, starting it"
+      systemctl start tiny-dfr.service
+    fi
+
+    if [ -s "$STATE/modules" ]; then
+      # Reverse order: Wi-Fi first, then Bluetooth
+      log "resume: reloading $(tac "$STATE/modules" | tr '\n' ' ')"
+      tac "$STATE/modules" | while read -r m; do run modprobe "$m"; done
+      udevadm settle --timeout=5
+    fi
+
+    if [ -s "$STATE/kbd-backlight" ] && [ -e "$KBD/brightness" ]; then
+      cat "$STATE/kbd-backlight" > "$KBD/brightness" 2>/dev/null
+    fi
+
+    # Restart user services that keep stale sysfs handles (only if running)
+    if [ -n "$RESTART_USER_SERVICES" ]; then
+      for d in /run/user/[0-9]*; do
+        u=$(id -nu "${d##*/}" 2>/dev/null) || continue
+        systemctl --user -M "$u@" try-restart $RESTART_USER_SERVICES 2>/dev/null
+      done
+    fi
+    log "resume: done"
+    ;;
+esac
+exit 0
