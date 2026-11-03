@@ -17,6 +17,19 @@ for f in \
   /etc/t2-suspend-fix.conf.new; do
   [ -e "$f" ] && rm -f "$f" && echo "  removed $f"
 done
+
+# The T2 drivers go back into the initramfs: regenerate it for this kernel
+DRACUT_CONF=/etc/dracut.conf.d/90-t2-suspend-fix.conf
+if [ -e "$DRACUT_CONF" ]; then
+  rm -f "$DRACUT_CONF"
+  echo "  removed $DRACUT_CONF, regenerating the initramfs of kernel $(uname -r)"
+  if command -v update-initramfs >/dev/null; then
+    update-initramfs -u -k "$(uname -r)" >/dev/null
+  else
+    dracut --force --kver "$(uname -r)" >/dev/null 2>&1
+  fi
+fi
+
 rmdir --ignore-fail-on-non-empty /etc/systemd/sleep.conf.d \
   /etc/systemd/system/systemd-suspend.service.d /etc/systemd/logind.conf.d 2>/dev/null || true
 

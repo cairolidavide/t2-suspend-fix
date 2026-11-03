@@ -10,16 +10,19 @@ Usage: sudo ./install.sh [options]
   --lid                    suspend when the lid is closed (logind drop-in)
   --bluetooth-autoenable   power on Bluetooth at boot (AutoEnable=true in
                            /etc/bluetooth/main.conf)
+  --keep-initramfs         do not keep the T2 drivers out of the initramfs
+                           (skipped automatically on encrypted disks)
   --force                  install even if no Apple T2 chip is detected
   -h, --help               show this help
 EOF
 }
 
-LID=no BT_AUTOENABLE=no FORCE=no
+LID=no BT_AUTOENABLE=no FORCE=no KEEP_INITRAMFS=no
 for arg in "$@"; do
   case "$arg" in
     --lid) LID=yes ;;
     --bluetooth-autoenable) BT_AUTOENABLE=yes ;;
+    --keep-initramfs) KEEP_INITRAMFS=yes ;;
     --force) FORCE=yes ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $arg" >&2; usage >&2; exit 1 ;;
@@ -28,6 +31,7 @@ done
 
 SRC=$(dirname "$(readlink -f "$0")")
 HOOK=/usr/lib/systemd/system-sleep/t2-suspend-fix
+DRACUT_CONF=/etc/dracut.conf.d/90-t2-suspend-fix.conf
 STATE_DIR=/var/lib/t2-suspend-fix
 BACKUP="$STATE_DIR/backup-$(date +%Y%m%d-%H%M%S)"
 
@@ -120,6 +124,46 @@ if [ "$BT_AUTOENABLE" = yes ]; then
   else
     warn "/etc/bluetooth/main.conf not found, Bluetooth option skipped"
   fi
+fi
+
+# Encrypted disk: the T2 keyboard must stay in the initramfs for the passphrase
+encrypted_disk() {
+  grep -qvE '^[[:space:]]*(#|$)' /etc/crypttab 2>/dev/null && return 0
+  lsblk -nro TYPE 2>/dev/null | grep -qx crypt
+}
+
+regenerate_initramfs() {
+  local kver
+  kver=$(uname -r)
+  info "regenerating the initramfs of kernel $kver (other kernels: at their next update)"
+  if command -v update-initramfs >/dev/null; then
+    update-initramfs -u -k "$kver" >/dev/null
+  else
+    dracut --force --kver "$kver" >/dev/null 2>&1
+  fi
+}
+
+if command -v dracut >/dev/null; then
+  if [ "$KEEP_INITRAMFS" = yes ]; then
+    info "initramfs left unchanged (--keep-initramfs)"
+  elif encrypted_disk; then
+    warn "encrypted disk: T2 drivers kept in the initramfs so the keyboard works at the passphrase prompt. If the Mac does not wake up from suspend, see \"Troubleshooting\" in the README"
+  elif cmp -s "$SRC/conf/dracut.conf.d/t2-suspend-fix.conf" "$DRACUT_CONF"; then
+    info "$DRACUT_CONF already up to date"
+  else
+    backup "$DRACUT_CONF"
+    install -Dm644 "$SRC/conf/dracut.conf.d/t2-suspend-fix.conf" "$DRACUT_CONF"
+    info "$DRACUT_CONF (T2 drivers out of the initramfs)"
+    regenerate_initramfs
+  fi
+  for f in /etc/dracut.conf.d/*.conf; do
+    [ "$f" != "$DRACUT_CONF" ] && grep -q t2bce "$f" 2>/dev/null \
+      && info "$f also mentions t2bce: if it only did the same thing, it can be removed"
+  done
+fi
+if grep -qE '^[[:space:]]*(t2bce|apple.bce)' /etc/initramfs-tools/modules 2>/dev/null \
+   && ! command -v dracut >/dev/null; then
+  warn "/etc/initramfs-tools/modules loads the T2 driver in the initramfs: if the Mac does not wake up from suspend, remove it and run update-initramfs -u (unless the disk is encrypted)"
 fi
 
 for t in sleep.target suspend.target; do

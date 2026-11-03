@@ -21,9 +21,9 @@ diagnostica per vedere cosa succede sul proprio Mac.
   base prima che parta `tiny-dfr`
 - Schermo che resta nero all'apertura del coperchio finché non si preme un
   tasto (GNOME)
-- Retroilluminazione della tastiera spenta e
-  [wluma](https://github.com/max-baz/wluma) che smette di funzionare dopo il
-  risveglio
+- Retroilluminazione della tastiera spenta dopo il risveglio
+- Mac che dopo un aggiornamento del sistema non si risveglia più, con
+  `Failed to start Load Kernel Modules` all'avvio
 
 ## Perché succede
 
@@ -38,6 +38,7 @@ driver lo sospende e lo risveglia correttamente.
 | Risveglio di ~12 s | Il bridge e il controller Thunderbolt 3 di Intel impiegano ~10,5 s a risvegliarsi, anche senza nulla collegato. |
 | Touch Bar spenta o che lampeggia | Al risveglio il T2 ricollega la Touch Bar: systemd ferma `tiny-dfr` (`BindsTo=`) e non lo riavvia, mentre il driver della retroilluminazione la accende a piena luminosità con i tasti di base. |
 | Schermo nero all'apertura del coperchio | Da systemd 256 le sessioni utente vengono congelate durante la sospensione e GNOME perde l'evento di apertura del coperchio. |
+| Nessun risveglio dopo un aggiornamento | Con dracut, ogni aggiornamento che rigenera l'initramfs (kernel, systemd, ...) ci copia dentro `/etc/modules-load.d/`. Se un file lì elenca i driver `t2bce`, questi si caricano prima del filesystem principale, `t2bce_audio` fallisce, e da quel momento il Mac non si risveglia più dalla sospensione. |
 
 ## Cosa fa
 
@@ -58,11 +59,15 @@ Al risveglio (`post`, il più breve possibile):
 Poi, in background:
 
 1. Ricarica Wi-Fi e Bluetooth.
-2. Ripristina la retroilluminazione della tastiera e riavvia servizi utente
-   come `wluma`.
+2. Ripristina la luminosità della tastiera e, se configurato, riavvia servizi
+   utente.
 
 Installa anche due file di configurazione per systemd: solo sospensione S3
-(`deep`), e sessioni utente non congelate durante la sospensione.
+(`deep`), e sessioni utente non congelate durante la sospensione. Sui sistemi
+che usano dracut aggiunge un file di configurazione che tiene i driver
+`t2bce` fuori dall'initramfs, così si caricano sempre dopo l'avvio, e
+rigenera l'initramfs del kernel in uso. Con il disco cifrato questo passaggio
+viene saltato (vedi [Risoluzione dei problemi](#risoluzione-dei-problemi)).
 
 Il driver del T2 (`apple-bce` / `t2bce`) **non** viene scaricato: le versioni
 recenti salvano e ripristinano lo stato del T2 da sole, ed era proprio
@@ -113,6 +118,7 @@ Opzioni:
 |---|---|
 | `--lid` | Sospende alla chiusura del coperchio (aggiunge un file in `logind.conf.d`; con un monitor esterno collegato il coperchio viene ignorato) |
 | `--bluetooth-autoenable` | Accende il Bluetooth all'avvio (`AutoEnable=true` in `/etc/bluetooth/main.conf`) |
+| `--keep-initramfs` | Non aggiunge il file di configurazione di dracut (l'initramfs resta com'è) |
 | `--force` | Installa anche se non viene rilevato un chip T2 |
 
 L'installer salva una copia di ogni file che sostituisce in
@@ -139,9 +145,12 @@ sudo t2-suspend-diag       # controlla cosa è successo
 | `/etc/systemd/sleep.conf.d/t2-suspend-fix.conf` | `MemorySleepMode=deep` |
 | `/etc/systemd/system/systemd-suspend.service.d/t2-suspend-fix.conf` | Non congelare le sessioni utente |
 | `/etc/systemd/logind.conf.d/t2-suspend-fix-lid.conf` | Coperchio → sospensione (solo con `--lid`) |
+| `/etc/dracut.conf.d/90-t2-suspend-fix.conf` | Driver T2 fuori dall'initramfs (solo con dracut, non con il disco cifrato) |
 
 Non c'è niente da abilitare: `systemd-sleep` esegue l'hook a ogni
-sospensione, e tutto resta attivo dopo riavvii e aggiornamenti.
+sospensione, e tutto resta attivo dopo riavvii e aggiornamenti. Questi file
+non appartengono a nessun pacchetto, quindi gli aggiornamenti non li
+sovrascrivono e non li cancellano.
 
 ## Configurazione
 
@@ -154,7 +163,7 @@ successiva.
 | `FAST_THUNDERBOLT_RESUME` | `auto` | Rimuove e riscopre il ramo Thunderbolt se le porte USB-C non sono in uso (`no` per disattivare) |
 | `TOUCHBAR_FIX` | `auto` | Tiene spenta la Touch Bar finché `tiny-dfr` non è pronto (`no` per disattivare) |
 | `RESTORE_KBD_BACKLIGHT` | `yes` | Ripristina la luminosità della tastiera |
-| `RESTART_USER_SERVICES` | `wluma.service` | Servizi utente da riavviare dopo il risveglio, se attivi |
+| `RESTART_USER_SERVICES` | vuoto | Servizi utente da riavviare dopo il risveglio, se attivi (separati da spazi) |
 
 ## Diagnostica
 
@@ -200,6 +209,14 @@ volta `rfkill unblock bluetooth`.
 `suspend.target` non siano disattivati:
 `systemctl is-enabled suspend.target`.
 
+**Il Mac non si risveglia più, da dopo un aggiornamento.** Esegui
+`sudo t2-suspend-diag` e guarda la sezione *Initramfs*. Se elenca driver T2
+nell'initramfs, o se all'avvio è fallito `Load Kernel Modules`, l'initramfs è
+stato rigenerato con dentro i driver T2. Riesegui `sudo ./install.sh` e
+riavvia. Con il disco cifrato l'installer salta apposta questo passaggio: la
+tastiera interna serve nell'initramfs per digitare la password. Questo caso
+non è ancora gestito; apri una issue con l'output di `sudo t2-suspend-diag`.
+
 ## Limiti noti
 
 - Al risveglio la Touch Bar si accende circa mezzo secondo dopo lo schermo:
@@ -211,6 +228,19 @@ volta `rfkill unblock bluetooth`.
   ambienti isolati delle app snap ne mantengono una copia montata.
 - Con un dispositivo USB-C collegato il risveglio resta lento (vedi sopra).
 - L'ibernazione non è stata testata.
+- Il file di configurazione di dracut impedisce anche di copiare
+  `/etc/modules-load.d/` nell'initramfs. Quei moduli vengono comunque
+  caricati subito dopo l'avvio, come sempre; solo moduli necessari *prima*
+  del montaggio del filesystem principale andrebbero aggiunti all'initramfs
+  in un altro modo.
+- I sistemi che usano `initramfs-tools` invece di dracut non vengono
+  modificati: l'installer avvisa soltanto se `/etc/initramfs-tools/modules`
+  carica il driver T2.
+- [wluma](https://github.com/max-baz/wluma) 5 non ha bisogno di aiuto: ritrova
+  da solo i dispositivi di retroilluminazione ricreati in circa 2 s. Non
+  aggiungerlo a `RESTART_USER_SERVICES`: subito dopo il risveglio il sensore
+  di luce può non rispondere ancora, e un wluma appena avviato va in crash e
+  riprova per circa 30 s.
 
 ## Disinstallazione
 
@@ -218,8 +248,9 @@ volta `rfkill unblock bluetooth`.
 sudo ./uninstall.sh
 ```
 
-Rimuove tutti i file installati e ripristina l'impostazione `AutoEnable` del
-Bluetooth. Il tuo `/etc/t2-suspend-fix.conf` e le copie di backup in
+Rimuove tutti i file installati, rigenera l'initramfs del kernel in uso se
+era stato installato il file di dracut, e ripristina l'impostazione
+`AutoEnable` del Bluetooth. Il tuo `/etc/t2-suspend-fix.conf` e le copie di backup in
 `/var/lib/t2-suspend-fix/` vengono mantenuti; lo script ti dice come
 cancellarli.
 

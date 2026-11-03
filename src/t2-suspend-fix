@@ -23,8 +23,8 @@
 #    (bound to its devices) stops and must be restarted. The backlight driver
 #    is reloaded with brightness=0 so the Touch Bar stays dark until tiny-dfr
 #    is ready, instead of flashing the default layout.
-# 4. Keyboard backlight and user services (e.g. wluma) that hold stale sysfs
-#    handles are restored/restarted.
+# 4. The keyboard backlight level is restored, and optionally user services
+#    that keep stale sysfs handles are restarted.
 #
 # The T2 itself (apple-bce / t2bce drivers) is NOT touched: recent drivers
 # save and restore its state natively.
@@ -41,7 +41,7 @@ RELOAD_WIFI_BT=yes
 FAST_THUNDERBOLT_RESUME=auto
 TOUCHBAR_FIX=auto
 RESTORE_KBD_BACKLIGHT=yes
-RESTART_USER_SERVICES="wluma.service"
+RESTART_USER_SERVICES=""
 [ -r "$CONF" ] && . "$CONF"
 
 KBD=/sys/class/leds/apple::kbd_backlight

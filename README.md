@@ -19,8 +19,9 @@ causes, plus a diagnostic tool to see what happens on your machine.
 - Touch Bar blank after resume, or flashing the default layout before
   `tiny-dfr` starts
 - Screen staying black when the lid is opened until a key is pressed (GNOME)
-- Keyboard backlight off and [wluma](https://github.com/max-baz/wluma)
-  stopped working after resume
+- Keyboard backlight off after resume
+- The Mac never wakes up from suspend after a system update, with
+  `Failed to start Load Kernel Modules` at boot
 
 ## Why it happens
 
@@ -35,6 +36,7 @@ resumes it correctly.
 | Resume takes ~12 s | The Intel Thunderbolt 3 bridge and controller take ~10.5 s to resume, even with nothing plugged in. |
 | Touch Bar blank or flashing | The T2 re-enumerates the Touch Bar on resume: `tiny-dfr` is stopped by systemd (`BindsTo=`) and is not restarted, while the backlight driver turns the bar on at full brightness with the default layout. |
 | Black screen on lid open | Since systemd 256 user sessions are frozen during suspend, and GNOME misses the lid-open event. |
+| Never wakes up after an update | With dracut, any update that regenerates the initramfs (kernel, systemd, ...) copies `/etc/modules-load.d/` into it. If a file there lists the `t2bce` drivers, they load before the root filesystem, `t2bce_audio` fails, and from then on the Mac does not wake up from suspend. |
 
 ## What it does
 
@@ -54,11 +56,15 @@ After waking up (`post`, kept as short as possible):
 Then, in the background:
 
 1. Reloads Wi-Fi and Bluetooth.
-2. Restores the keyboard backlight and restarts user services such as
-   `wluma`.
+2. Restores the keyboard backlight level and, if configured, restarts user
+   services.
 
 It also installs two systemd drop-ins: S3 (`deep`) sleep only, and user
-sessions not frozen during suspend.
+sessions not frozen during suspend. On systems that use dracut it adds a
+dracut drop-in that keeps the `t2bce` drivers out of the initramfs, so they
+always load after boot, and regenerates the initramfs of the running kernel.
+This step is skipped on encrypted disks (see
+[Troubleshooting](#troubleshooting)).
 
 The T2 driver (`apple-bce` / `t2bce`) is **not** unloaded: recent versions
 save and restore the T2 state natively, and unloading it is what used to
@@ -107,6 +113,7 @@ Options:
 |---|---|
 | `--lid` | Suspend when the lid is closed (adds a `logind.conf.d` drop-in; with an external display connected the lid is ignored) |
 | `--bluetooth-autoenable` | Power on Bluetooth at boot (`AutoEnable=true` in `/etc/bluetooth/main.conf`) |
+| `--keep-initramfs` | Do not add the dracut drop-in (the initramfs is left as it is) |
 | `--force` | Install even if no T2 chip is detected |
 
 The installer backs up every file it replaces in `/var/lib/t2-suspend-fix/`,
@@ -132,9 +139,11 @@ sudo t2-suspend-diag       # check what happened
 | `/etc/systemd/sleep.conf.d/t2-suspend-fix.conf` | `MemorySleepMode=deep` |
 | `/etc/systemd/system/systemd-suspend.service.d/t2-suspend-fix.conf` | Do not freeze user sessions |
 | `/etc/systemd/logind.conf.d/t2-suspend-fix-lid.conf` | Lid → suspend (only with `--lid`) |
+| `/etc/dracut.conf.d/90-t2-suspend-fix.conf` | T2 drivers out of the initramfs (dracut only, not on encrypted disks) |
 
 Nothing has to be enabled: `systemd-sleep` runs the hook at every suspend,
-and everything survives reboots and updates.
+and everything survives reboots and updates. No package owns these files,
+so updates never overwrite or remove them.
 
 ## Configuration
 
@@ -146,7 +155,7 @@ Edit `/etc/t2-suspend-fix.conf`; changes apply from the next suspend.
 | `FAST_THUNDERBOLT_RESUME` | `auto` | Remove/rescan the Thunderbolt branch when USB-C is unused (`no` to disable) |
 | `TOUCHBAR_FIX` | `auto` | Keep the Touch Bar dark until `tiny-dfr` is ready (`no` to disable) |
 | `RESTORE_KBD_BACKLIGHT` | `yes` | Restore the keyboard backlight level |
-| `RESTART_USER_SERVICES` | `wluma.service` | User services to restart after resume, if running |
+| `RESTART_USER_SERVICES` | empty | User services to restart after resume, if running (space separated) |
 
 ## Diagnostics
 
@@ -191,6 +200,15 @@ If it is still off, systemd-rfkill may have saved it as blocked: run
 **Suspend does not happen at all.** Check that `sleep.target` and
 `suspend.target` are not masked: `systemctl is-enabled suspend.target`.
 
+**The Mac does not wake up at all, since an update.** Run
+`sudo t2-suspend-diag` and look at the *Initramfs* section. If it lists T2
+drivers in the initramfs, or `Load Kernel Modules` failed at boot, the
+initramfs was regenerated with the T2 drivers inside. Re-run
+`sudo ./install.sh` and reboot. On an encrypted disk the installer skips
+this step on purpose: the internal keyboard is needed in the initramfs to
+type the passphrase. This case is not handled yet; please open an issue with
+the output of `sudo t2-suspend-diag`.
+
 ## Known limitations
 
 - On resume the Touch Bar lights up about half a second after the screen:
@@ -202,6 +220,18 @@ If it is still off, systemd-rfkill may have saved it as blocked: run
   because snap sandboxes keep their own mounts.
 - With a USB-C device connected, resume stays slow (see above).
 - Hibernation has not been tested.
+- The dracut drop-in also stops dracut from copying `/etc/modules-load.d/`
+  into the initramfs. Those modules are still loaded right after boot, as
+  usual; only modules needed *before* the root filesystem is mounted would
+  have to be added to the initramfs another way.
+- Systems using `initramfs-tools` instead of dracut are not changed: the
+  installer only warns if `/etc/initramfs-tools/modules` loads the T2
+  driver.
+- [wluma](https://github.com/max-baz/wluma) 5 needs no help: it picks up the
+  re-created backlight devices by itself within ~2 s. Do not add it to
+  `RESTART_USER_SERVICES`: right after resume the ambient light sensor may
+  not answer yet, and a freshly started wluma then crashes and retries for
+  ~30 s.
 
 ## Uninstall
 
@@ -209,8 +239,9 @@ If it is still off, systemd-rfkill may have saved it as blocked: run
 sudo ./uninstall.sh
 ```
 
-This removes every installed file and restores the Bluetooth `AutoEnable`
-setting. Your `/etc/t2-suspend-fix.conf` and the backups in
+This removes every installed file, regenerates the initramfs of the running
+kernel if the dracut drop-in was installed, and restores the Bluetooth
+`AutoEnable` setting. Your `/etc/t2-suspend-fix.conf` and the backups in
 `/var/lib/t2-suspend-fix/` are kept; the script tells you how to delete them.
 
 ## Reporting problems

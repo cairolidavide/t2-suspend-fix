@@ -66,6 +66,31 @@ else
   echo "Hook not installed ($HOOK missing)"
 fi
 
+section "Initramfs"
+initrd=/boot/initrd.img-$(uname -r)
+[ -e "$initrd" ] || initrd=/boot/initramfs-$(uname -r).img
+if [ ! -e "$initrd" ]; then
+  echo "initramfs of $(uname -r) not found"
+elif [ ! -r "$initrd" ]; then
+  echo "run with sudo to inspect $initrd"
+else
+  if command -v lsinitrd >/dev/null; then lister=lsinitrd; else lister=lsinitramfs; fi
+  t2mods=$($lister "$initrd" 2>/dev/null | grep -oE '(t2bce_[a-z]+|apple-bce)\.ko' | sort -u | tr '\n' ' ')
+  if [ -n "$t2mods" ]; then
+    echo "T2 drivers in the initramfs: $t2mods"
+    echo "  loaded before the root filesystem; if the Mac does not wake up, see Troubleshooting"
+  else
+    echo "T2 drivers in the initramfs: none (loaded after boot)"
+  fi
+fi
+[ -e /etc/dracut.conf.d/90-t2-suspend-fix.conf ] && echo "dracut drop-in:  /etc/dracut.conf.d/90-t2-suspend-fix.conf"
+if journalctl -b -q --no-pager 2>/dev/null | grep -q 'Failed to start systemd-modules-load'; then
+  echo "WARNING: 'Load Kernel Modules' failed at this boot:"
+  journalctl -b -q --no-pager -o cat 2>/dev/null | grep -E '^Failed to insert module|^Error running install command' | head -3 | sed 's/^/  /'
+fi
+failed=$(journalctl -b -q --no-pager 2>/dev/null | grep -c 'Failed to put system to sleep')
+[ "$failed" -gt 0 ] && echo "WARNING: $failed failed suspend attempts at this boot"
+
 section "Other sleep hooks (may conflict)"
 others=$(grep -lE 'apple.bce|t2bce|brcmfmac|hci_bcm|thunderbolt|tiny-dfr' \
   /usr/lib/systemd/system-sleep/* 2>/dev/null | grep -v "/t2-suspend-fix$")
