@@ -24,12 +24,16 @@ diagnostica per vedere cosa succede sul proprio Mac.
 - Retroilluminazione della tastiera spenta dopo il risveglio
 - Mac che dopo un aggiornamento del sistema non si risveglia più, con
   `Failed to start Load Kernel Modules` all'avvio
+- Mac trovato acceso e caldo al mattino dopo aver chiuso il coperchio: una
+  sospensione fallita ritentata in loop tutta la notte
 
 ## Perché succede
 
 Queste sono le cause trovate analizzando i log del kernel di un
-MacBookPro15,4. Il chip T2 si è rivelato *non* essere il colpevole: il suo
-driver lo sospende e lo risveglia correttamente.
+MacBookPro15,4. Quasi tutte *non* stanno nel chip T2: il suo driver lo
+sospende e lo risveglia correttamente quasi sempre. Quando non ci riesce, il
+driver non sa riprendersi ("Acceso e caldo" qui sotto), quindi l'hook
+limita i danni.
 
 | Problema | Causa |
 |---|---|
@@ -38,6 +42,7 @@ driver lo sospende e lo risveglia correttamente.
 | Risveglio di ~12 s | Il bridge e il controller Thunderbolt 3 di Intel impiegano ~10,5 s a risvegliarsi, anche senza nulla collegato. |
 | Touch Bar spenta o che lampeggia | Al risveglio il T2 ricollega la Touch Bar: systemd ferma `tiny-dfr` (`BindsTo=`) e non lo riavvia, mentre il driver della retroilluminazione la accende a piena luminosità con i tasti di base. |
 | Schermo nero all'apertura del coperchio | Da systemd 256 le sessioni utente vengono congelate durante la sospensione e GNOME perde l'evento di apertura del coperchio. |
+| Acceso e caldo dopo una notte a coperchio chiuso | Raramente il T2 smette comunque di rispondere durante una sospensione (`t2bce_dma: command queue timeout`, poi `t2bce_vhci: HC died`). La sospensione fallisce e, visto che il coperchio è ancora chiuso, logind la ritenta subito, all'infinito: in una notte si sono visti oltre 2000 tentativi falliti. In più systemd ripiega su s2idle dopo ogni tentativo S3 fallito, raddoppiandoli. |
 | Nessun risveglio dopo un aggiornamento | Con dracut, ogni aggiornamento che rigenera l'initramfs (kernel, systemd, ...) ci copia dentro `/etc/modules-load.d/`. Se un file lì elenca i driver `t2bce`, questi si caricano prima del filesystem principale, `t2bce_audio` fallisce, e da quel momento il Mac non si risveglia più dalla sospensione. |
 
 ## Cosa fa
@@ -53,7 +58,12 @@ Prima della sospensione (`pre`):
 Al risveglio (`post`, il più breve possibile):
 
 1. Riscopre il ramo Thunderbolt (~50 ms).
-2. Ricarica il driver della retroilluminazione della Touch Bar con
+2. Controlla che il T2 risponda (il suo bus USB virtuale ha ancora tastiera,
+   trackpad, Touch Bar, ...).
+3. Sicurezza: se il coperchio è chiuso e il T2 non risponde, o sono
+   fallite 3 sospensioni di fila, spegne il Mac invece di lasciare che logind
+   ritenti la sospensione in loop.
+4. Ricarica il driver della retroilluminazione della Touch Bar con
    `brightness=0` e riavvia `tiny-dfr` appena i suoi dispositivi sono pronti.
 
 Poi, in background:
@@ -63,15 +73,19 @@ Poi, in background:
    utente.
 
 Installa anche due file di configurazione per systemd: solo sospensione S3
-(`deep`), e sessioni utente non congelate durante la sospensione. Sui sistemi
+(`deep`) senza ripiego su s2idle, e sessioni utente non congelate durante la sospensione. Sui sistemi
 che usano dracut aggiunge un file di configurazione che tiene i driver
 `t2bce` fuori dall'initramfs, così si caricano sempre dopo l'avvio, e
 rigenera l'initramfs del kernel in uso. Con il disco cifrato questo passaggio
 viene saltato (vedi [Risoluzione dei problemi](#risoluzione-dei-problemi)).
 
-Il driver del T2 (`apple-bce` / `t2bce`) **non** viene scaricato: le versioni
-recenti salvano e ripristinano lo stato del T2 da sole, ed era proprio
-scaricarlo a creare problemi.
+Il driver del T2 (`apple-bce` / `t2bce`) **non** viene scaricato prima della
+sospensione: le versioni recenti salvano e ripristinano lo stato del T2 da
+sole, ed era proprio scaricarlo a creare problemi. Un T2 che ha smesso di
+rispondere non viene recuperato di default: ricollegare il driver `t2bce` fa
+andare in crash il kernel (vedi `T2_RECOVERY`), e non c'è reset PCI (le
+funzioni del T2 non hanno un metodo di reset, e un reset del bus colpirebbe
+anche l'SSD interno, che sta sullo stesso slot).
 
 Misure su un MacBookPro15,4:
 
@@ -142,7 +156,7 @@ sudo t2-suspend-diag       # controlla cosa è successo
 | `/usr/lib/systemd/system-sleep/t2-suspend-fix` | L'hook di sospensione |
 | `/etc/t2-suspend-fix.conf` | Impostazioni |
 | `/usr/local/bin/t2-suspend-diag` | Strumento di diagnostica |
-| `/etc/systemd/sleep.conf.d/t2-suspend-fix.conf` | `MemorySleepMode=deep` |
+| `/etc/systemd/sleep.conf.d/t2-suspend-fix.conf` | `SuspendState=mem`, `MemorySleepMode=deep` |
 | `/etc/systemd/system/systemd-suspend.service.d/t2-suspend-fix.conf` | Non congelare le sessioni utente |
 | `/etc/systemd/logind.conf.d/t2-suspend-fix-lid.conf` | Coperchio → sospensione (solo con `--lid`) |
 | `/etc/dracut.conf.d/90-t2-suspend-fix.conf` | Driver T2 fuori dall'initramfs (solo con dracut, non con il disco cifrato) |
@@ -164,6 +178,10 @@ successiva.
 | `TOUCHBAR_FIX` | `auto` | Tiene spenta la Touch Bar finché `tiny-dfr` non è pronto (`no` per disattivare) |
 | `RESTORE_KBD_BACKLIGHT` | `yes` | Ripristina la luminosità della tastiera |
 | `RESTART_USER_SERVICES` | vuoto | Servizi utente da riavviare dopo il risveglio, se attivi (separati da spazi) |
+| `T2_RECOVERY` | `no` | **Sperimentale.** Ricollega il driver del T2 se ha smesso di rispondere durante una sospensione. Con `t2bce` 0.07 manda il kernel in Oops: scollegare `t2bce_core` lascia `t2bce_vhci` attivo su registri non più mappati |
+| `T2_RECOVERY_ATTEMPTS` | `2` | Tentativi di recupero dopo ogni sospensione |
+| `FAILSAFE_POWEROFF` | `yes` | A coperchio chiuso, spegne se il T2 non risponde o la sospensione continua a fallire |
+| `FAILSAFE_MAX_FAILURES` | `3` | Sospensioni fallite di fila prima di spegnere |
 
 ## Diagnostica
 
@@ -192,6 +210,17 @@ stato lasciato al suo posto per non scollegarlo. Nel registro trovi
 **Wi-Fi o Bluetooth assenti dopo il risveglio.** Cerca errori con
 `journalctl -b -t t2-suspend-fix`. Per riattivarli senza riavviare:
 `sudo modprobe brcmfmac; sudo modprobe hci_bcm4377`.
+
+**Tastiera e trackpad morti dopo il risveglio.** Il T2 ha smesso di
+rispondere: solo un riavvio lo riporta in vita. `sudo t2-suspend-diag`
+mostra quanti dispositivi ha il bus USB del T2 (0 = il T2 non risponde).
+L'hook ha un comando sperimentale `recover` che ricollega il driver del T2,
+ma con `t2bce` manda in crash il kernel: non usarlo.
+
+**Il Mac si è spento da solo a coperchio chiuso.** È la sicurezza: la
+sospensione è fallita con il coperchio chiuso. Il perché si vede con
+`journalctl -b -1 -t t2-suspend-fix` e
+`journalctl -b -1 -k | grep -E 't2bce|PM:'`.
 
 **Porte USB-C non funzionanti dopo il risveglio.** Riscopri il bus PCI con
 `echo 1 | sudo tee /sys/bus/pci/rescan` e apri una segnalazione con l'output
@@ -228,6 +257,9 @@ non è ancora gestito; apri una issue con l'output di `sudo t2-suspend-diag`.
   ambienti isolati delle app snap ne mantengono una copia montata.
 - Con un dispositivo USB-C collegato il risveglio resta lento (vedi sopra).
 - L'ibernazione non è stata testata.
+- La sicurezza limita solo i danni quando il T2 smette di rispondere durante
+  una sospensione; la causa è nel driver del T2, e lì sta anche il recupero
+  che manca.
 - Il file di configurazione di dracut impedisce anche di copiare
   `/etc/modules-load.d/` nell'initramfs. Quei moduli vengono comunque
   caricati subito dopo l'avvio, come sempre; solo moduli necessari *prima*

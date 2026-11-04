@@ -25,9 +25,15 @@
 #    is ready, instead of flashing the default layout.
 # 4. The keyboard backlight level is restored, and optionally user services
 #    that keep stale sysfs handles are restarted.
+# 5. Failsafe: if the lid is closed and the T2 stopped answering during a
+#    suspend (its USB bus is left without devices: keyboard, trackpad, Touch
+#    Bar and audio dead), or suspend keeps failing, the Mac is powered off:
+#    otherwise logind retries the suspend in a loop all night, with the Mac
+#    awake and hot in a bag. Optionally (T2_RECOVERY=yes, experimental) the
+#    T2 driver is first unbound and probed again.
 #
-# The T2 itself (apple-bce / t2bce drivers) is NOT touched: recent drivers
-# save and restore its state natively.
+# The T2 driver (apple-bce / t2bce) is not unloaded before sleeping: recent
+# drivers save and restore its state natively.
 
 set -u
 
@@ -42,11 +48,20 @@ FAST_THUNDERBOLT_RESUME=auto
 TOUCHBAR_FIX=auto
 RESTORE_KBD_BACKLIGHT=yes
 RESTART_USER_SERVICES=""
+# Off by default: with the t2bce driver, unbinding t2bce_core leaves
+# t2bce_vhci running on the old mappings and the kernel oopses
+T2_RECOVERY=no
+T2_RECOVERY_ATTEMPTS=2
+FAILSAFE_POWEROFF=yes
+FAILSAFE_MAX_FAILURES=3
 [ -r "$CONF" ] && . "$CONF"
 
 KBD=/sys/class/leds/apple::kbd_backlight
+# Consecutive failed suspends; outside $STATE, which is reset at every "pre"
+FAILURES=/run/$NAME.failures
 
 log() { logger -t "$NAME" "$*"; }
+log_crit() { logger -t "$NAME" -p crit "$*"; }
 run() { "$@" 2>&1 | logger -t "$NAME"; }
 attr() { cat "$1/$2" 2>/dev/null; }
 
@@ -127,6 +142,135 @@ tinydfr_wait_devices() {
   return 1
 }
 
+# --- T2 health and recovery -------------------------------------------------
+
+# PCI address of a T2 function: 0x1801 bridge (BCE), 0x1803 audio
+t2_function() {
+  local d
+  for d in /sys/bus/pci/devices/*; do
+    [ "$(attr "$d" vendor)" = 0x106b ] && [ "$(attr "$d" device)" = "$1" ] \
+      && { echo "${d##*/}"; return 0; }
+  done
+  return 1
+}
+
+# Number of USB devices on the T2 virtual USB bus (keyboard, trackpad, Touch
+# Bar, camera, ...). When the T2 stops answering ("HC died") they all
+# disconnect, while the bus itself may stay.
+t2_usb_devices() {
+  local bridge hub n=0
+  bridge=$(t2_function 0x1801) || { echo 0; return; }
+  for hub in /sys/bus/usb/devices/usb*; do
+    case "$(readlink -f "$hub")" in
+      */"$bridge"/*)
+        n=$(find "$(readlink -f "$hub")" -maxdepth 1 -regextype egrep \
+              -regex '.*/[0-9]+-[0-9.]+' | wc -l)
+        break ;;
+    esac
+  done
+  echo "$n"
+}
+
+# Wait up to $1 seconds for the T2 USB devices to be there
+t2_wait_alive() {
+  local i
+  for i in $(seq $(( $1 * 10 ))); do
+    [ "$(t2_usb_devices)" -gt 0 ] && return 0
+    sleep 0.1
+  done
+  [ "$(t2_usb_devices)" -gt 0 ]
+}
+
+# Write $2 to sysfs file $3, giving up after $1 seconds: with a dead T2 the
+# driver's remove callback can block on commands that never complete
+write_timeout() {
+  local secs=$1 value=$2 file=$3 pid i
+  ( echo "$value" > "$file" ) 2>/dev/null &
+  pid=$!
+  for i in $(seq $(( secs * 10 ))); do
+    kill -0 "$pid" 2>/dev/null || { wait "$pid"; return; }
+    sleep 0.1
+  done
+  log "T2 recovery: writing $value to $file still blocked after ${secs}s"
+  return 2
+}
+
+# Unbind the T2 drivers (audio first, it depends on the bridge) and let the
+# kernel probe them again. No PCI reset: the T2 functions have no reset method
+# and a bus reset would also hit the internal SSD on the same slot.
+# EXPERIMENTAL: on t2bce 0.07 (kernel 7.2) unbinding t2bce_core leaves the
+# t2bce_vhci child device bound (device_links_driver_cleanup warning) and a
+# t2bce_vhci worker then writes to the unmapped registers: kernel oops.
+t2_recover() {
+  local bridge audio dev drv
+  bridge=$(t2_function 0x1801) || return 1
+  audio=$(t2_function 0x1803)
+  for dev in $audio $bridge; do
+    [ -e "/sys/bus/pci/devices/$dev/driver" ] || continue
+    drv=$(readlink -f "/sys/bus/pci/devices/$dev/driver")
+    write_timeout 10 "$dev" "$drv/unbind" || return 2
+  done
+  for dev in $bridge $audio; do
+    [ -e "/sys/bus/pci/devices/$dev/driver" ] && continue
+    write_timeout 10 "$dev" /sys/bus/pci/drivers_probe || return 2
+  done
+  t2_wait_alive 10
+}
+
+# Try T2_RECOVERY_ATTEMPTS times; stop early if a sysfs write hangs, since
+# the device lock stays held and further attempts would hang too
+t2_recover_attempts() {
+  local i rc
+  for i in $(seq "$T2_RECOVERY_ATTEMPTS"); do
+    log "$1: T2 not answering (no devices on its USB bus), recovery attempt $i/$T2_RECOVERY_ATTEMPTS"
+    t2_recover; rc=$?
+    if [ "$rc" -eq 0 ]; then
+      log "$1: T2 recovered, $(t2_usb_devices) USB devices back"
+      return 0
+    fi
+    [ "$rc" -eq 2 ] && break
+  done
+  log_crit "$1: T2 recovery failed: keyboard, trackpad, Touch Bar and audio stay dead until reboot"
+  return 1
+}
+
+lid_closed() {
+  grep -qs closed /proc/acpi/button/lid/*/state
+}
+
+# After a suspend: count failures, revive the T2 if needed, and power off if
+# the lid is closed and the Mac cannot sleep (logind would retry forever).
+# Returns 1 if a power-off was requested.
+failsafe() {
+  local before now failed=0 t2ok=yes reason=""
+  before=$(cat "$STATE/suspend-fail" 2>/dev/null)
+  now=$(attr /sys/power/suspend_stats fail)
+  if [ -n "$before" ] && [ -n "$now" ] && [ "$now" -gt "$before" ]; then
+    failed=$(( $(cat "$FAILURES" 2>/dev/null || echo 0) + 1 ))
+    echo "$failed" > "$FAILURES"
+    log "$1: suspend failed ($failed in a row), last failed device: $(attr /sys/power/suspend_stats last_failed_dev)"
+  else
+    rm -f "$FAILURES"
+  fi
+
+  # Grace period: the T2 re-enumerates some devices during resume
+  if ! t2_wait_alive 3; then
+    t2ok=no
+    [ "$T2_RECOVERY" = yes ] && t2_recover_attempts "$1" && t2ok=yes
+  fi
+
+  [ "$FAILSAFE_POWEROFF" = yes ] && lid_closed || return 0
+  if [ "$t2ok" = no ]; then
+    reason="T2 not answering"
+  elif [ "$failed" -ge "$FAILSAFE_MAX_FAILURES" ]; then
+    reason="$failed failed suspends in a row"
+  fi
+  [ -n "$reason" ] || return 0
+  log_crit "$1: $reason with the lid closed: powering off instead of retrying the suspend in a loop"
+  systemctl poweroff --no-block
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 
 if ! is_t2; then
@@ -150,16 +294,39 @@ case "${1:-}" in
       echo "Thunderbolt branch:    none behind a PCIe bridge"
     fi
     echo "tiny-dfr:              $(systemctl is-active tiny-dfr.service 2>/dev/null)"
+    n=$(t2_usb_devices)
+    echo "T2 USB bus:            $n devices$([ "$n" -eq 0 ] && echo " (T2 NOT ANSWERING: sudo $SELF recover)")"
     echo "Touch Bar backlight:   $([ -e /sys/module/hid_appletb_bl ] && echo hid_appletb_bl || echo not loaded)"
     echo "Keyboard backlight:    $([ -e "$KBD" ] && echo "$KBD" || echo none)"
     echo "Config:                $([ -r "$CONF" ] && echo "$CONF" || echo "defaults")"
     echo "  RELOAD_WIFI_BT=$RELOAD_WIFI_BT FAST_THUNDERBOLT_RESUME=$FAST_THUNDERBOLT_RESUME TOUCHBAR_FIX=$TOUCHBAR_FIX"
     echo "  RESTORE_KBD_BACKLIGHT=$RESTORE_KBD_BACKLIGHT RESTART_USER_SERVICES=\"$RESTART_USER_SERVICES\""
+    echo "  T2_RECOVERY=$T2_RECOVERY T2_RECOVERY_ATTEMPTS=$T2_RECOVERY_ATTEMPTS FAILSAFE_POWEROFF=$FAILSAFE_POWEROFF FAILSAFE_MAX_FAILURES=$FAILSAFE_MAX_FAILURES"
+    ;;
+
+  recover)
+    # Manual: sudo /usr/lib/systemd/system-sleep/t2-suspend-fix recover
+    # Experimental, see t2_recover: can oops the kernel with t2bce
+    [ "$(id -u)" -eq 0 ] || { echo "Run as root: sudo $SELF recover" >&2; exit 1; }
+    echo "WARNING: experimental. With the t2bce driver this can crash the kernel (oops); save your work first." >&2
+    if [ "$(t2_usb_devices)" -gt 0 ] && [ "${2:-}" != --force ]; then
+      echo "The T2 is answering ($(t2_usb_devices) USB devices): nothing to do (--force to re-bind anyway)."
+      exit 0
+    fi
+    T2_RECOVERY_ATTEMPTS=1
+    if t2_recover_attempts recover; then
+      systemctl try-restart tiny-dfr.service
+      echo "T2 recovered: $(t2_usb_devices) USB devices."
+    else
+      echo "T2 recovery failed: reboot to get keyboard and trackpad back." >&2
+      exit 1
+    fi
     ;;
 
   pre)
     rm -rf "$STATE"; mkdir -p "$STATE"
     log "pre $2: $(attr /sys/class/dmi/id product_name), kernel $(uname -r)"
+    attr /sys/power/suspend_stats fail > "$STATE/suspend-fail"
 
     if systemctl is-active --quiet tiny-dfr.service; then
       touch "$STATE/tinydfr"
@@ -201,6 +368,9 @@ case "${1:-}" in
         log "post $2: Thunderbolt rescan of $root, branch back: $([ -e "/sys/bus/pci/devices/$branch" ] && echo yes || echo NO)"
       done < "$STATE/thunderbolt"
     fi
+
+    # Before tiny-dfr: the Touch Bar needs a working T2
+    failsafe "post $2" || exit 0
 
     # tiny-dfr fails immediately if its devices are not active yet in
     # systemd, so wait for them (tens of ms, 2 s at most) before restarting

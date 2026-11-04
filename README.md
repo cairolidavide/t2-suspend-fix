@@ -22,12 +22,15 @@ causes, plus a diagnostic tool to see what happens on your machine.
 - Keyboard backlight off after resume
 - The Mac never wakes up from suspend after a system update, with
   `Failed to start Load Kernel Modules` at boot
+- The Mac found awake and hot in the morning after closing the lid: a failed
+  suspend retried in a loop all night
 
 ## Why it happens
 
 These are the causes found by analysing the kernel logs of a MacBookPro15,4.
-The T2 chip turned out *not* to be the culprit: the T2 driver suspends and
-resumes it correctly.
+Most of them are *not* in the T2 chip: the T2 driver suspends and resumes it
+correctly almost every time. When it does not, the driver cannot recover
+("Awake and hot" below), so the hook limits the damage.
 
 | Problem | Cause |
 |---|---|
@@ -36,6 +39,7 @@ resumes it correctly.
 | Resume takes ~12 s | The Intel Thunderbolt 3 bridge and controller take ~10.5 s to resume, even with nothing plugged in. |
 | Touch Bar blank or flashing | The T2 re-enumerates the Touch Bar on resume: `tiny-dfr` is stopped by systemd (`BindsTo=`) and is not restarted, while the backlight driver turns the bar on at full brightness with the default layout. |
 | Black screen on lid open | Since systemd 256 user sessions are frozen during suspend, and GNOME misses the lid-open event. |
+| Awake and hot after a night with the lid closed | Rarely the T2 still stops answering during a suspend (`t2bce_dma: command queue timeout`, then `t2bce_vhci: HC died`). The suspend fails, and since the lid is still closed logind retries it immediately, forever: over 2000 failed attempts in one night were observed. systemd also falls back to s2idle after every failed S3 attempt, doubling them. |
 | Never wakes up after an update | With dracut, any update that regenerates the initramfs (kernel, systemd, ...) copies `/etc/modules-load.d/` into it. If a file there lists the `t2bce` drivers, they load before the root filesystem, `t2bce_audio` fails, and from then on the Mac does not wake up from suspend. |
 
 ## What it does
@@ -50,7 +54,12 @@ Before suspending (`pre`):
 After waking up (`post`, kept as short as possible):
 
 1. Rescans the Thunderbolt branch (~50 ms).
-2. Reloads the Touch Bar backlight driver with `brightness=0` and restarts
+2. Checks that the T2 is answering (its virtual USB bus still has the
+   keyboard, trackpad, Touch Bar, ...).
+3. Failsafe: if the lid is closed and the T2 is not answering, or 3
+   suspends in a row have failed, powers the Mac off instead of letting
+   logind retry the suspend in a loop.
+4. Reloads the Touch Bar backlight driver with `brightness=0` and restarts
    `tiny-dfr` as soon as its devices are ready.
 
 Then, in the background:
@@ -59,16 +68,20 @@ Then, in the background:
 2. Restores the keyboard backlight level and, if configured, restarts user
    services.
 
-It also installs two systemd drop-ins: S3 (`deep`) sleep only, and user
+It also installs two systemd drop-ins: S3 (`deep`) sleep only, with no
+fallback to s2idle, and user
 sessions not frozen during suspend. On systems that use dracut it adds a
 dracut drop-in that keeps the `t2bce` drivers out of the initramfs, so they
 always load after boot, and regenerates the initramfs of the running kernel.
 This step is skipped on encrypted disks (see
 [Troubleshooting](#troubleshooting)).
 
-The T2 driver (`apple-bce` / `t2bce`) is **not** unloaded: recent versions
-save and restore the T2 state natively, and unloading it is what used to
-break things.
+The T2 driver (`apple-bce` / `t2bce`) is **not** unloaded before sleeping:
+recent versions save and restore the T2 state natively, and unloading it is
+what used to break things. A dead T2 is not revived by default: re-binding
+the `t2bce` driver crashes the kernel (see `T2_RECOVERY`), and there is no
+PCI reset (the T2 functions have no reset method, and a bus reset would also
+hit the internal SSD on the same slot).
 
 Measured on a MacBookPro15,4:
 
@@ -136,7 +149,7 @@ sudo t2-suspend-diag       # check what happened
 | `/usr/lib/systemd/system-sleep/t2-suspend-fix` | The sleep hook |
 | `/etc/t2-suspend-fix.conf` | Settings |
 | `/usr/local/bin/t2-suspend-diag` | Diagnostic tool |
-| `/etc/systemd/sleep.conf.d/t2-suspend-fix.conf` | `MemorySleepMode=deep` |
+| `/etc/systemd/sleep.conf.d/t2-suspend-fix.conf` | `SuspendState=mem`, `MemorySleepMode=deep` |
 | `/etc/systemd/system/systemd-suspend.service.d/t2-suspend-fix.conf` | Do not freeze user sessions |
 | `/etc/systemd/logind.conf.d/t2-suspend-fix-lid.conf` | Lid → suspend (only with `--lid`) |
 | `/etc/dracut.conf.d/90-t2-suspend-fix.conf` | T2 drivers out of the initramfs (dracut only, not on encrypted disks) |
@@ -156,6 +169,10 @@ Edit `/etc/t2-suspend-fix.conf`; changes apply from the next suspend.
 | `TOUCHBAR_FIX` | `auto` | Keep the Touch Bar dark until `tiny-dfr` is ready (`no` to disable) |
 | `RESTORE_KBD_BACKLIGHT` | `yes` | Restore the keyboard backlight level |
 | `RESTART_USER_SERVICES` | empty | User services to restart after resume, if running (space separated) |
+| `T2_RECOVERY` | `no` | **Experimental.** Re-bind the T2 driver if the T2 stopped answering during a suspend. With `t2bce` 0.07 it oopses the kernel: unbinding `t2bce_core` leaves `t2bce_vhci` running on unmapped registers |
+| `T2_RECOVERY_ATTEMPTS` | `2` | Recovery attempts after each suspend |
+| `FAILSAFE_POWEROFF` | `yes` | With the lid closed, power off if the T2 is not answering or suspend keeps failing |
+| `FAILSAFE_MAX_FAILURES` | `3` | Failed suspends in a row before powering off |
 
 ## Diagnostics
 
@@ -184,6 +201,17 @@ avoid disconnecting it. The log says
 **Wi-Fi or Bluetooth missing after resume.** Check
 `journalctl -b -t t2-suspend-fix` for errors. To bring them back without
 rebooting: `sudo modprobe brcmfmac; sudo modprobe hci_bcm4377`.
+
+**Keyboard and trackpad dead after resume.** The T2 stopped answering: only
+a reboot brings it back. `sudo t2-suspend-diag` shows how many devices the
+T2 USB bus has (0 = T2 not answering). The hook has an experimental
+`recover` command that re-binds the T2 driver, but with `t2bce` it crashes
+the kernel: do not use it.
+
+**The Mac powered off by itself with the lid closed.** That is the failsafe:
+the suspend failed and the lid was closed. See why with
+`journalctl -b -1 -t t2-suspend-fix` and
+`journalctl -b -1 -k | grep -E 't2bce|PM:'`.
 
 **USB-C ports not working after resume.** Rescan the PCI bus:
 `echo 1 | sudo tee /sys/bus/pci/rescan`, and please open an issue with the
@@ -220,6 +248,8 @@ the output of `sudo t2-suspend-diag`.
   because snap sandboxes keep their own mounts.
 - With a USB-C device connected, resume stays slow (see above).
 - Hibernation has not been tested.
+- The failsafe only limits the damage when the T2 stops answering during a
+  suspend; the cause is in the T2 driver, and so is the missing recovery.
 - The dracut drop-in also stops dracut from copying `/etc/modules-load.d/`
   into the initramfs. Those modules are still loaded right after boot, as
   usual; only modules needed *before* the root filesystem is mounted would
